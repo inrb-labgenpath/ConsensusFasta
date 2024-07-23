@@ -1,0 +1,158 @@
+import os
+from datetime import datetime
+import time
+import re
+from shutil import copyfile
+
+import pandas as pd
+import re
+
+configfile: "config.json"
+
+reference = config["reference"]
+bed_file = config["bed_file"]
+out_dir = config["out_dir"]
+con_threshold = config["consensus_threshold"]
+samples_path = config["samples_path"]
+primers_fasta = config["primers_fasta"]
+pair_information = config["pair_information"]
+
+
+df = pd.read_table(samples_path, sep="\t")
+_ = df.groupby("sample").sum()
+lib_delim = config["library_delimiter"]
+
+_["sample_library"] = _["sample_library"].apply(lambda x: x.split(lib_delim)[0] +"_" + "_".join(re.findall("L[0-9]+", x)))
+
+rule all:
+    input:
+        expand("{out_dir}/iSNV/{sample}.tsv", out_dir = out_dir, sample = _["sample_library"])
+
+rule call_variants_post_removal:
+    input:
+        "{out_dir}/final_clean/{sample}.clean.sorted.bam",
+        "{ref}".format(ref=reference)
+    output:
+        "{out_dir}/iSNV/{sample}.tsv"
+    shell:
+        "samtools mpileup -A -d 0 --reference {input[1]} -Q 0 -F 0 {input[0]} | ivar variants -p {output} -q 20 -t 0.03"
+
+rule remove_reads:
+    input:
+        "{out_dir}/trimmed_bams/{sample}.trimmed.sorted.bam",
+        "{out_dir}/primer_mismatches/{sample}_masked_primer_names.txt",
+        "{bed_file}".format(bed_file = bed_file)
+    output:
+        "{out_dir}/final_clean/{sample}.clean.sorted.bam",
+        temp("{out_dir}/final_clean/{sample}.clean.bam")
+    params:
+        prefix="{out_dir}/final_clean/{sample}.clean"
+    shell:
+        """
+        ivar removereads -i {input[0]} -p {params.prefix} -t {input[1]} -b {input[2]}
+        samtools sort -T {wildcards.sample} -o {output[0]} {params.prefix}.bam
+        samtools index {output}
+        """
+
+rule get_masked:
+    input:
+        "{out_dir}/primer_mismatches/{sample}.tsv",
+        "{out_dir}/primer_mismatches/bed/{sample}.bed",
+        "{pair_information}".format(pair_information = pair_information)
+    output:
+        "{out_dir}/primer_mismatches/{sample}_masked_primer_names.txt"
+    shell:
+        "ivar getmasked -i {input[0]} -b {input[1]}  -f {input[2]} -p {output}"
+
+rule call_variants_in_primer:
+    input:
+        "{out_dir}/primer_mismatches/bed/{sample}.bam",
+        "{out_dir}/consensus_sequences/{sample}.fa"
+    output:
+        "{out_dir}/primer_mismatches/{sample}.tsv"
+    shell:
+        "samtools mpileup -A -d 0 --reference {input[1]} -Q 0 -F 0 {input[0]} | ivar variants -p {output} -t 0.03"
+
+rule create_bed:
+    input:
+        "{out_dir}/primer_mismatches/bed/{sample}.bam"
+    output:
+        "{out_dir}/primer_mismatches/bed/{sample}.bed"
+    shell:
+        """
+        bedtools bamtobed -i {input} > {output}
+        """
+
+rule create_primer_bam:
+    input:
+        "{out_dir}/consensus_sequences/index/{sample}.bwt",
+    output:
+        "{out_dir}/primer_mismatches/bed/{sample}.bam"
+    params:
+        index= "{out_dir}/consensus_sequences/index/{sample}",
+        primers="{primers_fasta}".format(primers_fasta = primers_fasta)
+    shell:
+        """
+        bwa mem -k 5 -T 16 {params.index} {params.primers} | samtools view -bS -F 4 | samtools sort -T {wildcards.sample} -o {output}
+        """
+
+rule call_consensus:
+    input:
+        "{out_dir}/trimmed_bams/{sample}.trimmed.sorted.bam"
+    output:
+        "{out_dir}/consensus_sequences/{sample}.fa",
+        "{out_dir}/consensus_sequences/index/{sample}.bwt"
+    shell:
+        """
+        samtools mpileup -A -Q 0 -d 300000 {input} | ivar consensus -p {output[0]} -m {con_threshold} -n N
+        bwa index -p {wildcards.out_dir}/consensus_sequences/index/{wildcards.sample} {output[0]}
+        """
+
+rule trim_reads:
+    input:
+        "{out_dir}/merged_aligned_bams/{sample}.sorted.bam"
+    output:
+        "{out_dir}/trimmed_bams/{sample}.trimmed.sorted.bam"
+    params:
+        bed="{bed}".format(bed = bed_file),
+        tmp="{out_dir}/trimmed_bams/{sample}.trimmed.bam"
+    shell:
+        """
+        ivar trim -e -i {input} -b {params.bed} -p {params.tmp}
+        samtools sort -T {wildcards.sample}.trim -o {output} {params.tmp}
+        rm {params.tmp}
+        """
+
+rule merge_multiple_libraries:
+    input:
+        bams=lambda wildcards: df[df["sample"] == _[_["sample_library"] == wildcards.sample].index.values[0]]["sample_library"].apply(lambda x: os.path.join(out_dir, "aligned_bams", x +".sorted.bam")).tolist(),
+        forward=lambda wildcards: df[df["sample"] == _[_["sample_library"] == wildcards.sample].index.values[0]]["forward"].sort_values().tolist(),
+        reverse=lambda wildcards: df[df["sample"] == _[_["sample_library"] == wildcards.sample].index.values[0]]["reverse"].sort_values().tolist()
+    output:
+        bam="{out_dir}/merged_aligned_bams/{sample}.sorted.bam",
+        fastq=expand("{{out_dir}}/merged_fastq/{{sample}}_R{readno}.fastq.gz", readno=[1,2])
+    params:
+        tmp="{out_dir}/merged_aligned_bams/{sample}.bam"
+    shell:
+        """
+        samtools merge {params.tmp} {input.bams}
+        samtools sort -T {wildcards.sample}.merge -o {output.bam} {params.tmp}
+        rm {params.tmp}
+        cat {input.forward} > {output.fastq[0]}
+        cat {input.reverse} > {output.fastq[1]}
+        """
+
+rule align_reads:
+    input:
+        lambda wildcards: df[df["sample_library"]==wildcards.sample][["forward", "reverse"]].values[0].tolist()
+    output:
+        temp("{out_dir}/aligned_bams/{sample}.sorted.bam")
+    params:
+        ref= "{ref}".format(ref = reference),
+        tmp="{out_dir}/aligned_bams/{sample}.sorted.tmp.bam"
+    shell:
+        """
+        bwa mem {params.ref} {input[0]} {input[1]} | samtools view -F 4 -Sb | samtools sort -T {wildcards.sample}.align -o {params.tmp}
+        samtools addreplacerg -r "ID:{wildcards.sample}" -o {output} {params.tmp}
+        rm {params.tmp}
+        """

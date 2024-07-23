@@ -1,0 +1,12 @@
+{
+  "reference": "/data/ivar/db/DRC-2018-MAN-REF.fa",
+  "bed_file": "/data/ivar/db/drc_primers.bed",
+  "out_dir": "/home/inrb/Desktop/BaseCalls/iSNV_out_cov100",
+  "consensus_threshold": "100",
+  "samples_path": "samples.tsv",
+  "library_delimiter": "_",
+
+  "pair_information": "/data/ivar/db/drc_primers.tsv",
+  "primers_fasta": "/data/ivar/db/drc_primers.fa"
+}
+
